@@ -426,6 +426,19 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
   （`iv.end > start AND iv.start < end`）。
 - 筛选同时作用于时间轴、故障列表、故障事件列表、标注列表、维护窗口列表、原始事件表和导出。
 
+## 并发与事务语义（只读接口的已提交视图）
+
+SQLite 以 **WAL** 模式运行，读写使用**不同的数据库连接**：
+
+- **写入**（导入、撤销、规则 / 维护 / 有效期变更、故障重算、清空）全部在共享写连接上执行，
+  由写锁串行化；导入、撤销与规则重算各自保持**原有的单事务边界**——任一步失败整体回滚。
+- **读取**（`db.query` / `db.query_one`，即事件、故障、配置等所有 SELECT）走**每线程独立的
+  只读连接**（`PRAGMA query_only`），只读接口因此永远只读到**已提交**的数据：写事务提交前读到
+  旧值、提交后读到新值，**回滚的内容始终不可见**——并发导入 / 撤销 / 重算进行中，
+  `/api/events`、`/api/faults`、时间轴等接口都不会读到写事务中途的临时行。
+- **`/api/events` 的 `total` 与事件列表取自同一提交快照**：COUNT 与分页 SELECT 包在同一个
+  只读事务（`db.read_snapshot()`）中，并发提交夹在两次 SELECT 之间也不会造成数量与记录不一致。
+
 ## 故障事件归并语义
 
 「故障事件」是**只读派生视图**，不改写、不删除 `fault_intervals` 中的任何原始故障结果：
@@ -822,7 +835,7 @@ app/
   recovery.py         # 单通道突变恢复诊断（只读）：相邻有效样本按实际时间差计算变化速率、TTL 到期空档切断连续性（不跨空档判突变）、范围起点前仍有效最近样本作基线、超阈记下基线后在观察时长内找首个回到回归容差内的样本（已恢复/恢复耗时，否则观察超时/有效期空档/范围结束）、已归属片段不重复开段（diagnose_mutation_recovery）
   engine.py           # 半开区间、扫描线 AND/OR 合并、持续时长过滤、证据、条件复位阈值（迟滞锁存）、通道采样有效期(TTL)截断、维护扣除/抑制、区间聚类（事件归并）、草稿影响对比（diff_faults）、规则组合故障日账切分（daily_fault_ledger / utc_midnight）
 
-  db.py               # SQLite 连接、建表（imports/import_snapshots 导入批次与导入前快照、channel_ttls 与 rule_conditions.reset_threshold，含老库自动加列迁移）、基础查询、upsert/快照写入
+  db.py               # SQLite 连接（共享写连接 + 每线程只读连接的已提交视图、read_snapshot 单快照多读）、建表（imports/import_snapshots 导入批次与导入前快照、channel_ttls 与 rule_conditions.reset_threshold，含老库自动加列迁移）、基础查询、upsert/快照写入
   services.py         # JSONL 导入（导入前快照、导入后自动重算）、导入批次列表与批次撤销（undo_import，事务删除/恢复+刷新故障）、规则评估、草稿预览（preview_rule）、采样有效期设置/清除、时间轴抽样、筛选、故障事件归并、被抑制片段、规则组合故障日账（query_fault_daily_ledger）、采样节拍稽核（query_sampling_audit，只读 events）、冗余通道一致性核查（query_channel_consistency，只读 events/channel_ttls）、规则故障先后配对（query_fault_pairing，只读 fault_intervals）、单通道突变恢复诊断（query_mutation_recovery，只读 events/channel_ttls）、导出
   main.py             # FastAPI 路由与静态页面（含 /api/imports 列表与 /api/imports/{id}/undo 撤销、/api/channel-ttls、只读 /api/fault-daily-ledger、只读 /api/sampling-audit、只读 /api/consistency-check、只读 /api/fault-pairing 与只读 /api/mutation-recovery；条件复位阈值校验）
   static/             # 原生 JS 前端（index.html / app.js / styles.css，侧栏含「导入批次 / 撤销」卡片与撤销入口、规则弹层内含「预览影响」与每条件「复位阈值」、侧栏含「采样有效期」卡片与泳道 TTL 徽标、故障卡片下含「规则组合故障日账」勾选与逐日表格、「采样节拍稽核」通道选择/参数表单/汇总与缺采段表格、「冗余通道一致性核查」双通道选择/阈值表单/汇总与不一致片段表格、「规则故障先后配对」双规则选择/最大滞后表单/配对与未配对表格、「单通道突变恢复诊断」通道选择/阈值/容差/观察时长表单与逐段起止样本/最大偏差/恢复耗时/未恢复原因表格）
@@ -848,6 +861,7 @@ tests/
   test_fault_pairing_api.py  # 配对接口：只取起点落窗的已保存故障、配对/未配对/配对率、换向无配对、同规则 400、未知规则 404、倒置范围 400、非法滞后 400/422、缺参 422、只读不写故障或事件
   test_mutation_recovery.py     # 突变恢复诊断：实际时间差速率/严格大于阈值、不规则采样、观察时长内含边界恢复与超时、最大偏差、起点前样本作基线/TTL 到期不作基线、TTL 空档切断与三类未恢复原因、已归属样本不重复开段（恢复样本不反开/超时后可新跳）、半开右端、同刻后值覆盖、参数校验
   test_mutation_recovery_api.py # 突变恢复诊断接口：已恢复/未恢复片段与汇总、起点前基线、TTL 切断与清除后恢复、三类未恢复原因、不重复开段、未知通道 404、倒置范围 400、非正阈值/观察时长与负容差 422、非有限 400、缺参 422、只读不写事件或故障
+  test_read_committed.py  # 只读层已提交视图：未提交写入与回滚内容对读层/接口不可见、提交后可见、read_snapshot 固定同一提交快照（嵌套合并）、/api/events 的 total 与列表同快照、故障/时间轴/配置接口并发读一致性
 Dockerfile / docker-compose.yml / requirements.txt
 ```
 
@@ -890,4 +904,7 @@ UTC 午夜切分、跨日片段只在起始日计新起 / 后续日计延续、�
 已到期不外推、TTL 到期空档切断连续性（不跨空档判突变 / 恢复，空档与观察时长按时刻先后定原因）、
 已归属片段的样本不重复开段（恢复样本不反向开段、观察超时后同点可作为新突变起始）、三类未恢复原因
 （观察超时 / 有效期空档 / 范围结束）、最大偏差及样本、半开右端、同刻后值覆盖、非正阈值 / 观察时长、
-负容差与非有限参数拒绝、未知通道 404、接口只读不写事件或故障结果。
+负容差与非有限参数拒绝、未知通道 404、接口只读不写事件或故障结果；以及只读层的**已提交视图**：
+写事务未提交的插入 / 修改 / 删除与回滚内容对事件、故障、配置等只读查询和接口不可见，提交后
+立即可见，`read_snapshot` 把多条 SELECT 固定在同一提交快照（嵌套块并入外层快照），
+`/api/events` 的 `total` 与分页列表取自同一快照，并发提交不会造成数量与记录不一致。

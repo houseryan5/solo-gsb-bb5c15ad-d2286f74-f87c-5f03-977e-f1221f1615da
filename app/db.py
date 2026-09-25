@@ -149,12 +149,44 @@ def connect() -> sqlite3.Connection:
 _conn: sqlite3.Connection | None = None
 _write_lock = threading.RLock()
 
+# Read connections are thread-local: every thread reading through
+# query()/query_one() gets its own connection, so a multi-statement read
+# snapshot on one thread never leaks into another thread's statements.
+_read_local = threading.local()
+
 
 def get_conn() -> sqlite3.Connection:
     global _conn
     if _conn is None:
         _conn = connect()
     return _conn
+
+
+def get_read_conn() -> sqlite3.Connection:
+    """This thread's dedicated read connection — the committed view.
+
+    Read queries never touch the shared write connection: rows written by a
+    still-open write transaction (which a rollback would erase) are invisible
+    here, because a separate WAL connection only ever sees committed
+    snapshots.  The connection is recreated when DB_PATH changes underneath
+    us (the test-suite swaps database files between cases).
+    """
+    conn = getattr(_read_local, "conn", None)
+    if conn is None or _read_local.path != DB_PATH:
+        if conn is not None:
+            try:
+                conn.close()
+            except sqlite3.Error:
+                pass
+        conn = connect()
+        # Autocommit: each SELECT reads the latest committed snapshot;
+        # read_snapshot() opens an explicit read transaction when several
+        # SELECTs must share one snapshot.
+        conn.isolation_level = None
+        conn.execute("PRAGMA query_only = ON")
+        _read_local.conn = conn
+        _read_local.path = DB_PATH
+    return conn
 
 
 def init_db() -> None:
@@ -199,12 +231,35 @@ def transaction():
             raise
 
 
+@contextmanager
+def read_snapshot():
+    """Pin this thread's read connection to a single committed snapshot.
+
+    Every SELECT through query()/query_one() inside the block (they run on
+    the same thread-local connection) observes the database as of one
+    commit, so a writer committing between two SELECTs cannot skew their
+    results — e.g. a COUNT and the page of rows it counts.  Nested blocks
+    join the outer snapshot.
+    """
+    conn = get_read_conn()
+    if conn.in_transaction:
+        yield conn  # already inside a snapshot on this thread
+        return
+    conn.execute("BEGIN")
+    try:
+        yield conn
+    finally:
+        conn.rollback()  # read-only: ends the snapshot, nothing to commit
+
+
 def query(sql: str, params: Iterable[Any] = ()) -> list[sqlite3.Row]:
-    return get_conn().execute(sql, tuple(params)).fetchall()
+    """Run a SELECT against the committed view, never the write transaction."""
+    return get_read_conn().execute(sql, tuple(params)).fetchall()
 
 
 def query_one(sql: str, params: Iterable[Any] = ()) -> sqlite3.Row | None:
-    return get_conn().execute(sql, tuple(params)).fetchone()
+    """Single-row SELECT against the committed view."""
+    return get_read_conn().execute(sql, tuple(params)).fetchone()
 
 
 def execute(sql: str, params: Iterable[Any] = ()) -> sqlite3.Cursor:

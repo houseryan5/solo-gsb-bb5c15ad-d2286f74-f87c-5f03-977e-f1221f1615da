@@ -592,11 +592,14 @@ def list_events(
         params.append(metric)
     clause = (" WHERE " + " AND ".join(where)) if where else ""
 
-    total = db.query_one(f"SELECT COUNT(*) AS c FROM events{clause}", params)["c"]
-    rows = db.query(
-        f"SELECT id, device, metric, ts, value, import_id FROM events{clause} ORDER BY ts, id LIMIT ? OFFSET ?",
-        (*params, limit, offset),
-    )
+    # COUNT and the page must come from one committed snapshot: a concurrent
+    # import committing between the two SELECTs must not skew total vs rows.
+    with db.read_snapshot():
+        total = db.query_one(f"SELECT COUNT(*) AS c FROM events{clause}", params)["c"]
+        rows = db.query(
+            f"SELECT id, device, metric, ts, value, import_id FROM events{clause} ORDER BY ts, id LIMIT ? OFFSET ?",
+            (*params, limit, offset),
+        )
     return [dict(r) for r in rows], total
 
 
