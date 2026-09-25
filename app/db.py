@@ -137,12 +137,28 @@ CREATE TABLE IF NOT EXISTS channel_ttls (
 """
 
 
-def connect() -> sqlite3.Connection:
+def connect(read_only: bool = False) -> sqlite3.Connection:
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    conn = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
+    conn = sqlite3.connect(
+        DB_PATH,
+        timeout=30,
+        check_same_thread=False,
+        # Readers run in autocommit: with no Python-level implicit
+        # transaction each statement opens its own read transaction and
+        # releases it as soon as the rows are fetched, so a bare SELECT
+        # sees the latest committed snapshot and never holds a read lock
+        # that would block WAL writers.
+        isolation_level=None if read_only else "",
+    )
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
-    conn.execute("PRAGMA journal_mode = WAL")
+    if read_only:
+        # Defensive: this connection is the committed-view read layer and
+        # must never mutate the database. journal_mode is left untouched
+        # (the writer already persists WAL on the database file).
+        conn.execute("PRAGMA query_only = ON")
+    else:
+        conn.execute("PRAGMA journal_mode = WAL")
     return conn
 
 
@@ -155,6 +171,76 @@ def get_conn() -> sqlite3.Connection:
     if _conn is None:
         _conn = connect()
     return _conn
+
+
+# --------------------------------------------------------------------------- #
+# Read layer: connections that never take part in a write transaction.
+#
+# A single shared connection cannot read and write concurrently: while the
+# writer holds an open transaction on it, every SELECT executed through it
+# sees the writer's uncommitted changes (and after a rollback those reads
+# have observed rows that never existed).  Read-only access therefore goes
+# through separate per-thread connections.  In WAL mode a connection only
+# sees the database as it was committed when its read transaction started,
+# which gives readers an independent committed snapshot: uncommitted and
+# later-rolled-back writes are invisible, committed writes become visible
+# to the next statement/snapshot.
+# --------------------------------------------------------------------------- #
+
+_read_local = threading.local()
+
+
+def _get_read_conn() -> sqlite3.Connection:
+    conn: sqlite3.Connection | None = getattr(_read_local, "conn", None)
+    # Tests (and reconfiguration) may repoint DB_PATH and reset the writer;
+    # a reader cached for another file must be replaced before first use.
+    if conn is None or os.path.realpath(conn.execute("PRAGMA database_list").fetchone()[2]) \
+            != os.path.realpath(DB_PATH):
+        if conn is not None:
+            conn.close()
+        conn = connect(read_only=True)
+        _read_local.conn = conn
+    return conn
+
+
+@contextmanager
+def read_snapshot():
+    """Pin all read-layer queries made on this thread to one committed view.
+
+    Every ``query``/``query_one`` inside the block runs on the same read
+    connection inside one explicit read transaction, so multi-statement
+    reads (e.g. an events COUNT followed by its page SELECT) cannot have a
+    concurrent commit land between them.  The snapshot is the last committed
+    state at the block's entry; writes committed afterwards are not seen, and
+    uncommitted/rolled-back writes are never visible.
+    """
+    conn = _get_read_conn()
+    if getattr(_read_local, "snapshot_conn", None) is not None:
+        # Already inside a read snapshot on this thread: reuse it so the
+        # outer block owns the single pinned transaction.
+        yield conn
+        return
+    conn.execute("BEGIN")
+    _read_local.snapshot_conn = conn
+    try:
+        yield conn
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    else:
+        conn.execute("COMMIT")
+    finally:
+        _read_local.snapshot_conn = None
+
+
+def _read_target() -> sqlite3.Connection:
+    """Connection for an ad-hoc read: an open snapshot if one is active on
+    this thread, otherwise the thread's autocommit reader (one committed
+    snapshot per statement)."""
+    snapshot_conn = getattr(_read_local, "snapshot_conn", None)
+    if snapshot_conn is not None:
+        return snapshot_conn
+    return _get_read_conn()
 
 
 def init_db() -> None:
@@ -200,11 +286,11 @@ def transaction():
 
 
 def query(sql: str, params: Iterable[Any] = ()) -> list[sqlite3.Row]:
-    return get_conn().execute(sql, tuple(params)).fetchall()
+    return _read_target().execute(sql, tuple(params)).fetchall()
 
 
 def query_one(sql: str, params: Iterable[Any] = ()) -> sqlite3.Row | None:
-    return get_conn().execute(sql, tuple(params)).fetchone()
+    return _read_target().execute(sql, tuple(params)).fetchone()
 
 
 def execute(sql: str, params: Iterable[Any] = ()) -> sqlite3.Cursor:

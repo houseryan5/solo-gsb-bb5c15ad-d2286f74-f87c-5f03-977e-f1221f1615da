@@ -170,48 +170,49 @@ class UndoNotAllowed(Exception):
 
 def list_import_batches() -> list[dict]:
     """All import batches, newest first, with their undo eligibility."""
-    latest = db.query_one(
-        "SELECT MAX(id) AS id FROM imports WHERE revoked_at IS NULL"
-    )
-    latest_id = latest["id"] if latest is not None else None
-    rows = db.query(
-        """
-        SELECT i.*,
-               (SELECT COUNT(*) FROM import_snapshots s WHERE s.import_id = i.id) AS snapshot_rows,
-               (SELECT SUM(CASE WHEN s.event_id IS NOT NULL THEN 1 ELSE 0 END)
-                  FROM import_snapshots s WHERE s.import_id = i.id) AS overwritten_keys
-        FROM imports i
-        ORDER BY i.id DESC
-        """
-    )
-    batches: list[dict] = []
-    for row in rows:
-        batch = {
-            "id": row["id"],
-            "filename": row["filename"],
-            "imported_at": row["imported_at"],
-            "total_rows": row["total_rows"],
-            "inserted_rows": row["inserted_rows"],
-            "overwritten_rows": row["overwritten_rows"],
-            "skipped_rows": row["skipped_rows"],
-            "snapshot_keys": row["snapshot_rows"],
-            "overwritten_keys": row["overwritten_keys"] or 0,
-            "snapshot_complete": bool(row["snapshot_complete"]),
-            "revoked": row["revoked_at"] is not None,
-            "revoked_at": row["revoked_at"],
-            "can_undo": False,
-            "undo_reason": None,
-        }
-        if batch["revoked"]:
-            batch["undo_reason"] = "该批次已撤销"
-        elif not batch["snapshot_complete"]:
-            # Batch imported before the undo feature: nothing to restore from.
-            batch["undo_reason"] = "旧批次缺少导入前快照，无法撤销"
-        elif row["id"] != latest_id:
-            batch["undo_reason"] = "仅允许撤销最近一次未撤销的导入批次"
-        else:
-            batch["can_undo"] = True
-        batches.append(batch)
+    with db.read_snapshot():
+        latest = db.query_one(
+            "SELECT MAX(id) AS id FROM imports WHERE revoked_at IS NULL"
+        )
+        latest_id = latest["id"] if latest is not None else None
+        rows = db.query(
+            """
+            SELECT i.*,
+                   (SELECT COUNT(*) FROM import_snapshots s WHERE s.import_id = i.id) AS snapshot_rows,
+                   (SELECT SUM(CASE WHEN s.event_id IS NOT NULL THEN 1 ELSE 0 END)
+                      FROM import_snapshots s WHERE s.import_id = i.id) AS overwritten_keys
+            FROM imports i
+            ORDER BY i.id DESC
+            """
+        )
+        batches: list[dict] = []
+        for row in rows:
+            batch = {
+                "id": row["id"],
+                "filename": row["filename"],
+                "imported_at": row["imported_at"],
+                "total_rows": row["total_rows"],
+                "inserted_rows": row["inserted_rows"],
+                "overwritten_rows": row["overwritten_rows"],
+                "skipped_rows": row["skipped_rows"],
+                "snapshot_keys": row["snapshot_rows"],
+                "overwritten_keys": row["overwritten_keys"] or 0,
+                "snapshot_complete": bool(row["snapshot_complete"]),
+                "revoked": row["revoked_at"] is not None,
+                "revoked_at": row["revoked_at"],
+                "can_undo": False,
+                "undo_reason": None,
+            }
+            if batch["revoked"]:
+                batch["undo_reason"] = "该批次已撤销"
+            elif not batch["snapshot_complete"]:
+                # Batch imported before the undo feature: nothing to restore from.
+                batch["undo_reason"] = "旧批次缺少导入前快照，无法撤销"
+            elif row["id"] != latest_id:
+                batch["undo_reason"] = "仅允许撤销最近一次未撤销的导入批次"
+            else:
+                batch["can_undo"] = True
+            batches.append(batch)
     return batches
 
 
@@ -355,12 +356,17 @@ def evaluate_all_rules() -> dict:
     expired stretches satisfy no condition and likewise reset the duration.
     The suppressed pieces are stored alongside for the timeline/export.
     """
-    rules = db.fetch_rules()
-    events_by_channel, horizon = _load_events_index()
-    if horizon is None:
-        horizon = 0.0
-    maintenance = _load_maintenance_windows()
-    ttl_by_channel = _load_channel_ttls()
+    # Gather every evaluation input from one committed snapshot so the
+    # recomputed faults never combine rules/events/maintenance/TTLs read
+    # from different concurrent commits; the fault replacement below keeps
+    # its own write transaction boundary.
+    with db.read_snapshot():
+        rules = db.fetch_rules()
+        events_by_channel, horizon = _load_events_index()
+        if horizon is None:
+            horizon = 0.0
+        maintenance = _load_maintenance_windows()
+        ttl_by_channel = _load_channel_ttls()
 
     total = 0
     total_suppressed = 0
@@ -592,11 +598,15 @@ def list_events(
         params.append(metric)
     clause = (" WHERE " + " AND ".join(where)) if where else ""
 
-    total = db.query_one(f"SELECT COUNT(*) AS c FROM events{clause}", params)["c"]
-    rows = db.query(
-        f"SELECT id, device, metric, ts, value, import_id FROM events{clause} ORDER BY ts, id LIMIT ? OFFSET ?",
-        (*params, limit, offset),
-    )
+    # COUNT and the page SELECT must read the same committed snapshot:
+    # without pinning, a concurrent import commit between the two statements
+    # could return a total that does not match the listed rows.
+    with db.read_snapshot():
+        total = db.query_one(f"SELECT COUNT(*) AS c FROM events{clause}", params)["c"]
+        rows = db.query(
+            f"SELECT id, device, metric, ts, value, import_id FROM events{clause} ORDER BY ts, id LIMIT ? OFFSET ?",
+            (*params, limit, offset),
+        )
     return [dict(r) for r in rows], total
 
 
@@ -719,7 +729,11 @@ def query_fault_events(
     start: float | None = None, end: float | None = None
 ) -> list[dict]:
     """Fault events for the filter window; clustering sees every stored fault."""
-    return build_fault_events(query_faults(None, None), start, end)
+    # The full fault set is read in one committed view so the clustering
+    # never mixes intervals from before/after a concurrent rule recompute.
+    with db.read_snapshot():
+        faults = query_faults(None, None)
+    return build_fault_events(faults, start, end)
 
 
 def query_fault_daily_ledger(
@@ -752,22 +766,24 @@ def query_fault_daily_ledger(
             seen.add(rid)
             unique_ids.append(rid)
 
-    selected_rules: list[dict] = []
-    missing: list[int] = []
-    for rid in unique_ids:
-        rule = db.fetch_rule(rid)
-        if rule is None:
-            missing.append(rid)
-        else:
-            selected_rules.append(rule)
-    if missing:
-        raise KeyError(f"rule(s) not found: {', '.join(str(i) for i in missing)}")
+    # Rule definitions and their stored faults come from one committed view.
+    with db.read_snapshot():
+        selected_rules: list[dict] = []
+        missing: list[int] = []
+        for rid in unique_ids:
+            rule = db.fetch_rule(rid)
+            if rule is None:
+                missing.append(rid)
+            else:
+                selected_rules.append(rule)
+        if missing:
+            raise KeyError(f"rule(s) not found: {', '.join(str(i) for i in missing)}")
 
-    faults = [
-        f
-        for f in query_faults(None, None)
-        if f["rule_id"] in seen and f["end"] > start and f["start"] < end
-    ]
+        faults = [
+            f
+            for f in query_faults(None, None)
+            if f["rule_id"] in seen and f["end"] > start and f["start"] < end
+        ]
     intervals = [Interval(f["start"], f["end"]) for f in faults]
     merged = [iv for iv in union(intervals) if iv.end > start and iv.start < end]
     days = daily_fault_ledger(intervals, start, end)
@@ -824,26 +840,29 @@ def query_sampling_audit(
     if not math.isfinite(start) or not math.isfinite(end) or end <= start:
         raise ValueError("audit end must be greater than start (half-open [start, end))")
 
-    channel = db.query_one(
-        "SELECT COUNT(*) AS c, MIN(ts) AS min_ts, MAX(ts) AS max_ts FROM events"
-        " WHERE device = ? AND metric = ?",
-        (device, metric),
-    )
-    if channel is None or channel["c"] == 0:
-        raise KeyError(f"channel not found: {device}/{metric}")
+    # Channel totals and the windowed events are read from one snapshot so
+    # the reported channel metadata matches the reconciled samples.
+    with db.read_snapshot():
+        channel = db.query_one(
+            "SELECT COUNT(*) AS c, MIN(ts) AS min_ts, MAX(ts) AS max_ts FROM events"
+            " WHERE device = ? AND metric = ?",
+            (device, metric),
+        )
+        if channel is None or channel["c"] == 0:
+            raise KeyError(f"channel not found: {device}/{metric}")
 
-    rows = db.query(
-        "SELECT ts FROM events WHERE device = ? AND metric = ? AND ts >= ? AND ts < ?"
-        " ORDER BY ts, id",
-        (device, metric, start, end),
-    )
-    result = audit_cadence(
-        start,
-        end,
-        period_seconds,
-        tolerance_seconds,
-        (r["ts"] for r in rows),
-    )
+        rows = db.query(
+            "SELECT ts FROM events WHERE device = ? AND metric = ? AND ts >= ? AND ts < ?"
+            " ORDER BY ts, id",
+            (device, metric, start, end),
+        )
+        result = audit_cadence(
+            start,
+            end,
+            period_seconds,
+            tolerance_seconds,
+            (r["ts"] for r in rows),
+        )
     payload = result.to_dict()
     payload["device"] = device
     payload["metric"] = metric
@@ -934,25 +953,28 @@ def query_channel_consistency(
             raise KeyError(f"channel not found: {device}/{metric}")
         return row
 
-    info_a = channel_info(device_a, metric_a)
-    info_b = channel_info(device_b, metric_b)
+    # Both channels' samples, the horizon and the TTLs are read from one
+    # committed snapshot so the comparison inputs never straddle a commit.
+    with db.read_snapshot():
+        info_a = channel_info(device_a, metric_a)
+        info_b = channel_info(device_b, metric_b)
 
-    horizon_row = db.query_one("SELECT MAX(ts) AS hi FROM events")
-    horizon = horizon_row["hi"] if horizon_row and horizon_row["hi"] is not None else 0.0
+        horizon_row = db.query_one("SELECT MAX(ts) AS hi FROM events")
+        horizon = horizon_row["hi"] if horizon_row and horizon_row["hi"] is not None else 0.0
 
-    ttl_a = db.fetch_channel_ttl(device_a, metric_a)
-    ttl_b = db.fetch_channel_ttl(device_b, metric_b)
+        ttl_a = db.fetch_channel_ttl(device_a, metric_a)
+        ttl_b = db.fetch_channel_ttl(device_b, metric_b)
 
-    result = check_consistency(
-        _channel_samples_for_window(device_a, metric_a, start, end),
-        _channel_samples_for_window(device_b, metric_b, start, end),
-        horizon,
-        start,
-        end,
-        threshold,
-        ttl_a=ttl_a["ttl_seconds"] if ttl_a else None,
-        ttl_b=ttl_b["ttl_seconds"] if ttl_b else None,
-    )
+        result = check_consistency(
+            _channel_samples_for_window(device_a, metric_a, start, end),
+            _channel_samples_for_window(device_b, metric_b, start, end),
+            horizon,
+            start,
+            end,
+            threshold,
+            ttl_a=ttl_a["ttl_seconds"] if ttl_a else None,
+            ttl_b=ttl_b["ttl_seconds"] if ttl_b else None,
+        )
     payload = result.to_dict()
     payload["channel_a"] = {
         "device": device_a,
@@ -1006,31 +1028,34 @@ def query_fault_pairing(
     if not math.isfinite(max_lag) or max_lag <= 0:
         raise ValueError("max_lag_seconds must be a positive finite number of seconds")
 
-    cause_rule = db.fetch_rule(cause_rule_id)
-    if cause_rule is None:
-        raise KeyError(f"rule not found: {cause_rule_id}")
-    effect_rule = db.fetch_rule(effect_rule_id)
-    if effect_rule is None:
-        raise KeyError(f"rule not found: {effect_rule_id}")
+    # Both rule definitions and the stored faults come from one committed
+    # snapshot so pairing never matches intervals from mixed recomputations.
+    with db.read_snapshot():
+        cause_rule = db.fetch_rule(cause_rule_id)
+        if cause_rule is None:
+            raise KeyError(f"rule not found: {cause_rule_id}")
+        effect_rule = db.fetch_rule(effect_rule_id)
+        if effect_rule is None:
+            raise KeyError(f"rule not found: {effect_rule_id}")
 
-    # Stored faults whose START instant falls inside [start, end) — faults
-    # starting before the window never anchor a pair, however far they reach.
-    rows = db.query(
-        "SELECT id, rule_id, start_ts, end_ts FROM fault_intervals"
-        " WHERE rule_id IN (?, ?) AND start_ts >= ? AND start_ts < ?"
-        " ORDER BY start_ts, id",
-        (cause_rule_id, effect_rule_id, start, end),
-    )
-    causes = [
-        PairableFault(id=r["id"], start=r["start_ts"], end=r["end_ts"])
-        for r in rows
-        if r["rule_id"] == cause_rule_id
-    ]
-    effects = [
-        PairableFault(id=r["id"], start=r["start_ts"], end=r["end_ts"])
-        for r in rows
-        if r["rule_id"] == effect_rule_id
-    ]
+        # Stored faults whose START instant falls inside [start, end) — faults
+        # starting before the window never anchor a pair, however far they reach.
+        rows = db.query(
+            "SELECT id, rule_id, start_ts, end_ts FROM fault_intervals"
+            " WHERE rule_id IN (?, ?) AND start_ts >= ? AND start_ts < ?"
+            " ORDER BY start_ts, id",
+            (cause_rule_id, effect_rule_id, start, end),
+        )
+        causes = [
+            PairableFault(id=r["id"], start=r["start_ts"], end=r["end_ts"])
+            for r in rows
+            if r["rule_id"] == cause_rule_id
+        ]
+        effects = [
+            PairableFault(id=r["id"], start=r["start_ts"], end=r["end_ts"])
+            for r in rows
+            if r["rule_id"] == effect_rule_id
+        ]
 
     result = pair_faults(causes, effects, max_lag)
     payload = result.to_dict()
@@ -1095,32 +1120,35 @@ def query_mutation_recovery(
     if not math.isfinite(observation_seconds) or observation_seconds <= 0:
         raise ValueError("observation_seconds must be a positive finite number of seconds")
 
-    channel = db.query_one(
-        "SELECT COUNT(*) AS c, MIN(ts) AS min_ts, MAX(ts) AS max_ts FROM events"
-        " WHERE device = ? AND metric = ?",
-        (device, metric),
-    )
-    if channel is None or channel["c"] == 0:
-        raise KeyError(f"channel not found: {device}/{metric}")
+    # Channel totals, the pre-window baseline, windowed samples and the TTL
+    # share one committed snapshot.
+    with db.read_snapshot():
+        channel = db.query_one(
+            "SELECT COUNT(*) AS c, MIN(ts) AS min_ts, MAX(ts) AS max_ts FROM events"
+            " WHERE device = ? AND metric = ?",
+            (device, metric),
+        )
+        if channel is None or channel["c"] == 0:
+            raise KeyError(f"channel not found: {device}/{metric}")
 
-    before = db.query_one(
-        "SELECT id, ts, value FROM events"
-        " WHERE device = ? AND metric = ? AND value IS NOT NULL AND ts < ?"
-        " ORDER BY ts DESC, id DESC LIMIT 1",
-        (device, metric, start),
-    )
-    rows = db.query(
-        "SELECT id, ts, value FROM events"
-        " WHERE device = ? AND metric = ? AND value IS NOT NULL AND ts >= ? AND ts < ?"
-        " ORDER BY ts, id",
-        (device, metric, start, end),
-    )
-    samples: list[tuple[int, float, float]] = [(r["id"], r["ts"], r["value"]) for r in rows]
-    if before is not None:
-        samples.insert(0, (before["id"], before["ts"], before["value"]))
+        before = db.query_one(
+            "SELECT id, ts, value FROM events"
+            " WHERE device = ? AND metric = ? AND value IS NOT NULL AND ts < ?"
+            " ORDER BY ts DESC, id DESC LIMIT 1",
+            (device, metric, start),
+        )
+        rows = db.query(
+            "SELECT id, ts, value FROM events"
+            " WHERE device = ? AND metric = ? AND value IS NOT NULL AND ts >= ? AND ts < ?"
+            " ORDER BY ts, id",
+            (device, metric, start, end),
+        )
+        samples: list[tuple[int, float, float]] = [(r["id"], r["ts"], r["value"]) for r in rows]
+        if before is not None:
+            samples.insert(0, (before["id"], before["ts"], before["value"]))
 
-    ttl_row = db.fetch_channel_ttl(device, metric)
-    ttl = ttl_row["ttl_seconds"] if ttl_row else None
+        ttl_row = db.fetch_channel_ttl(device, metric)
+        ttl = ttl_row["ttl_seconds"] if ttl_row else None
 
     result = diagnose_mutation_recovery(
         samples,
@@ -1242,54 +1270,58 @@ def downsample(values: list[tuple[float, float, int]], max_points: int) -> list[
 
 
 def timeline_data(start: float | None, end: float | None, max_points: int = 400) -> dict:
-    channels = list_channels()
-    channels_in_range = []
-    for ch in channels:
-        if start is not None and ch["max_ts"] < start:
-            continue
-        if end is not None and ch["min_ts"] > end:
-            continue
-        channels_in_range.append(ch)
+    # The whole timeline is one committed view: channels, their samples,
+    # faults, annotations, maintenance and suppression must describe the
+    # same committed instant, not a mix across concurrent writes.
+    with db.read_snapshot():
+        channels = list_channels()
+        channels_in_range = []
+        for ch in channels:
+            if start is not None and ch["max_ts"] < start:
+                continue
+            if end is not None and ch["min_ts"] > end:
+                continue
+            channels_in_range.append(ch)
 
-    channel_payload = []
-    for ch in channels_in_range:
-        sql = (
-            "SELECT ts, value, id FROM events WHERE device = ? AND metric = ? AND value IS NOT NULL"
-        )
-        params: list = [ch["device"], ch["metric"]]
-        if start is not None:
-            sql += " AND ts >= ?"
-            params.append(start)
-        if end is not None:
-            sql += " AND ts <= ?"
-            params.append(end)
-        sql += " ORDER BY ts, id"
-        rows = db.query(sql, params)
-        values = [(r["ts"], r["value"], r["id"]) for r in rows]
-        total = len(values)
-        values = downsample(values, max_points)
-        channel_payload.append(
-            {
-                "device": ch["device"],
-                "metric": ch["metric"],
-                "count": ch["n"],
-                "shown": total,
-                "min_ts": ch["min_ts"],
-                "max_ts": ch["max_ts"],
-                "min_value": ch["min_value"],
-                "max_value": ch["max_value"],
-                "values": [{"ts": t, "v": v, "id": i} for t, v, i in values],
-            }
-        )
+        channel_payload = []
+        for ch in channels_in_range:
+            sql = (
+                "SELECT ts, value, id FROM events WHERE device = ? AND metric = ? AND value IS NOT NULL"
+            )
+            params: list = [ch["device"], ch["metric"]]
+            if start is not None:
+                sql += " AND ts >= ?"
+                params.append(start)
+            if end is not None:
+                sql += " AND ts <= ?"
+                params.append(end)
+            sql += " ORDER BY ts, id"
+            rows = db.query(sql, params)
+            values = [(r["ts"], r["value"], r["id"]) for r in rows]
+            total = len(values)
+            values = downsample(values, max_points)
+            channel_payload.append(
+                {
+                    "device": ch["device"],
+                    "metric": ch["metric"],
+                    "count": ch["n"],
+                    "shown": total,
+                    "min_ts": ch["min_ts"],
+                    "max_ts": ch["max_ts"],
+                    "min_value": ch["min_value"],
+                    "max_value": ch["max_value"],
+                    "values": [{"ts": t, "v": v, "id": i} for t, v, i in values],
+                }
+            )
 
-    bounds = db.query_one("SELECT MIN(ts) AS lo, MAX(ts) AS hi FROM events")
-    return {
-        "channels": channel_payload,
-        "channel_ttls": db.fetch_channel_ttls(),
-        "faults": query_faults(start, end),
-        "annotations": query_annotations(start, end),
-        "maintenance": db.fetch_maintenance_windows(start, end),
-        "suppressed": query_suppressed(start, end),
-        "data_start": bounds["lo"],
-        "data_end": bounds["hi"],
-    }
+        bounds = db.query_one("SELECT MIN(ts) AS lo, MAX(ts) AS hi FROM events")
+        return {
+            "channels": channel_payload,
+            "channel_ttls": db.fetch_channel_ttls(),
+            "faults": query_faults(start, end),
+            "annotations": query_annotations(start, end),
+            "maintenance": db.fetch_maintenance_windows(start, end),
+            "suppressed": query_suppressed(start, end),
+            "data_start": bounds["lo"],
+            "data_end": bounds["hi"],
+        }

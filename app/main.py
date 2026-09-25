@@ -214,14 +214,18 @@ def health() -> dict:
 
 @app.get("/api/meta")
 def meta() -> dict:
-    bounds = db.query_one("SELECT MIN(ts) AS lo, MAX(ts) AS hi FROM events")
+    # One committed view for all of the aggregate counters.
+    with db.read_snapshot():
+        bounds = db.query_one("SELECT MIN(ts) AS lo, MAX(ts) AS hi FROM events")
+        event_count = db.query_one("SELECT COUNT(*) AS c FROM events")["c"]
+        rule_count = db.query_one("SELECT COUNT(*) AS c FROM rules")["c"]
     return {
         "operators": sorted(OPERATORS),
         "logic": sorted(LOGIC),
         "data_start": bounds["lo"],
         "data_end": bounds["hi"],
-        "event_count": db.query_one("SELECT COUNT(*) AS c FROM events")["c"],
-        "rule_count": db.query_one("SELECT COUNT(*) AS c FROM rules")["c"],
+        "event_count": event_count,
+        "rule_count": rule_count,
     }
 
 
@@ -818,51 +822,55 @@ def export(
     start_ts = parse_bound(start)
     end_ts = parse_bound(end)
 
-    events, total = services.list_events(
-        start_ts, end_ts, limit=10_000_000, offset=0
-    )
-    faults = [f for f in services.query_faults(start_ts, end_ts)]
-    annotations = services.query_annotations(start_ts, end_ts)
-    maintenance = db.fetch_maintenance_windows(start_ts, end_ts)
-    suppressed = services.query_suppressed(start_ts, end_ts)
+    # The full export bundle describes one committed snapshot, so events,
+    # faults, rules, maintenance and evidence references cannot straddle a
+    # concurrent import / recompute commit.
+    with db.read_snapshot():
+        events, total = services.list_events(
+            start_ts, end_ts, limit=10_000_000, offset=0
+        )
+        faults = [f for f in services.query_faults(start_ts, end_ts)]
+        annotations = services.query_annotations(start_ts, end_ts)
+        maintenance = db.fetch_maintenance_windows(start_ts, end_ts)
+        suppressed = services.query_suppressed(start_ts, end_ts)
 
-    # Split fault evidence into explicit per-condition evidence references so
-    # the export carries raw events, fault intervals and their trigger proof.
-    event_ids: set[int] = {e["id"] for e in events}
-    referenced_events: list[dict] = []
-    seen: set[int] = set()
-    for fault in faults:
-        for group in fault["evidence"]:
-            for ev in group["events"]:
-                eid = ev["event_id"]
-                if eid not in seen and eid not in event_ids:
-                    seen.add(eid)
-                    row = db.query_one(
-                        "SELECT id, device, metric, ts, value FROM events WHERE id = ?",
-                        (eid,),
-                    )
-                    if row is not None:
-                        referenced_events.append(dict(row))
+        # Split fault evidence into explicit per-condition evidence references so
+        # the export carries raw events, fault intervals and their trigger proof.
+        event_ids: set[int] = {e["id"] for e in events}
+        referenced_events: list[dict] = []
+        seen: set[int] = set()
+        for fault in faults:
+            for group in fault["evidence"]:
+                for ev in group["events"]:
+                    eid = ev["event_id"]
+                    if eid not in seen and eid not in event_ids:
+                        seen.add(eid)
+                        row = db.query_one(
+                            "SELECT id, device, metric, ts, value FROM events WHERE id = ?",
+                            (eid,),
+                        )
+                        if row is not None:
+                            referenced_events.append(dict(row))
 
-    payload = {
-        "exported_at": time.time(),
-        "time_range": {
-            "start": start_ts,
-            "end": end_ts,
-            "note": "events filtered inclusively; fault intervals/annotations/maintenance windows overlap the half-open [start,end) window",
-        },
-        "rules": db.fetch_rules(),
-        "events": events,
-        "events_truncated": False,
-        "events_total_in_range": total,
-        "evidence_only_events": referenced_events,
-        "fault_intervals": faults,
-        "fault_events": services.query_fault_events(start_ts, end_ts),
-        "maintenance_windows": maintenance,
-        "suppressed_segments": suppressed,
-        "channel_ttls": db.fetch_channel_ttls(),
-        "annotations": annotations,
-    }
+        payload = {
+            "exported_at": time.time(),
+            "time_range": {
+                "start": start_ts,
+                "end": end_ts,
+                "note": "events filtered inclusively; fault intervals/annotations/maintenance windows overlap the half-open [start,end) window",
+            },
+            "rules": db.fetch_rules(),
+            "events": events,
+            "events_truncated": False,
+            "events_total_in_range": total,
+            "evidence_only_events": referenced_events,
+            "fault_intervals": faults,
+            "fault_events": services.query_fault_events(start_ts, end_ts),
+            "maintenance_windows": maintenance,
+            "suppressed_segments": suppressed,
+            "channel_ttls": db.fetch_channel_ttls(),
+            "annotations": annotations,
+        }
 
     if download:
         return JSONResponse(
